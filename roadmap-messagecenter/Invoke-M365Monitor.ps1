@@ -4,36 +4,47 @@
     Microsoft 365 Message Center & Roadmap Monitor
 
 .DESCRIPTION
-    Collects items from Message Center (Graph API) and the M365 Roadmap (public feed),
-    compares them against a local JSON database, emails new/changed items, then saves
-    the database atomically. A .bak copy is kept so the database survives script failures.
+    Collects Message Center (Graph API) and Roadmap (public page) items, diffs against a
+    local JSON database, emails new/changed items, and saves state atomically.
 
-    DB is only written AFTER a successful email send, so a transient send failure
-    automatically retries on the next run.
-
-.PARAMETER TenantId        Azure AD Tenant ID
-.PARAMETER ClientId        App registration Client ID
-.PARAMETER ClientSecret    App registration Client Secret (use a secure vault in production)
-.PARAMETER SenderMailbox   Mailbox UPN to send from (app needs Mail.Send permission)
-.PARAMETER Recipients      One or more recipient email addresses
-.PARAMETER NoEmail         Collect and update DB without sending email
-.PARAMETER ForceFullReport Send email even when no changes are detected
+.PARAMETER TenantId        Azure AD Tenant ID (GUID)
+.PARAMETER ClientId        App registration Client ID (GUID)
+.PARAMETER ClientSecret    App client secret. Prefer env var M365_CLIENT_SECRET to avoid
+                           the secret appearing in the process list / shell history.
+.PARAMETER SenderMailbox   UPN of the mailbox to send from (app needs Mail.Send)
+.PARAMETER Recipients      One or more recipient addresses
+.PARAMETER NoEmail         Collect and update DB without sending
+.PARAMETER ForceFullReport Send email even when no changes detected
 
 .EXAMPLE
-    .\Invoke-M365Monitor.ps1 `
-        -TenantId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-        -ClientId     "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy" `
-        -ClientSecret "your-secret" `
-        -SenderMailbox "reports@contoso.com" `
-        -Recipients    "admin@contoso.com","team@contoso.com"
+    $env:M365_CLIENT_SECRET = "…"
+    .\Invoke-M365Monitor.ps1 -TenantId "…" -ClientId "…" `
+        -SenderMailbox "reports@contoso.com" -Recipients "admin@contoso.com"
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string]   $TenantId,
-    [Parameter(Mandatory)] [string]   $ClientId,
-    [Parameter(Mandatory)] [string]   $ClientSecret,
-    [Parameter(Mandatory)] [string]   $SenderMailbox,
-    [Parameter(Mandatory)] [string[]] $Recipients,
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
+    [string] $TenantId,
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
+    [string] $ClientId,
+
+    # Prefer env var M365_CLIENT_SECRET — passing a secret on the command line exposes it
+    # in the process list and shell history. The parameter is kept for non-interactive use
+    # behind a vault wrapper or scheduled-task "run as" account.
+    [Parameter(Mandatory = $false)]
+    [string] $ClientSecret = "",
+
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[^@]+@[^@]+\.[^@]+$')]
+    [string] $SenderMailbox,
+
+    [Parameter(Mandatory)]
+    [ValidateCount(1, 50)]
+    [string[]] $Recipients,
+
     [switch] $NoEmail,
     [switch] $ForceFullReport
 )
@@ -41,8 +52,26 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$script:DbPath = Join-Path $PSScriptRoot "m365-monitor.json"
-$GRAPH         = "https://graph.microsoft.com/v1.0"
+$script:DbPath  = Join-Path $PSScriptRoot "m365-monitor.json"
+$GRAPH          = "https://graph.microsoft.com/v1.0"
+$GRAPH_HOST     = "graph.microsoft.com"          # used to validate nextLink
+$MAX_PAGE_ITEMS = 5000                            # safety cap on paged results
+
+# ── Resolve secret ─────────────────────────────────────────────────────────
+# Prefer env var so the value never appears in the process list.
+if (-not $ClientSecret) {
+    $ClientSecret = $env:M365_CLIENT_SECRET
+}
+if (-not $ClientSecret) {
+    throw "Provide -ClientSecret or set the M365_CLIENT_SECRET environment variable."
+}
+
+# Validate recipient addresses
+foreach ($r in $Recipients) {
+    if ($r -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        throw "Invalid recipient address: '$r'"
+    }
+}
 
 # ── Logging ────────────────────────────────────────────────────────────────
 
@@ -50,6 +79,49 @@ function Write-Log {
     param([string]$Msg, [string]$Level = "INFO")
     $color = switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} default {"Cyan"} }
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')][$Level] $Msg" -ForegroundColor $color
+}
+
+# ── HTML encoding ──────────────────────────────────────────────────────────
+# All untrusted data interpolated into HTML must pass through this function.
+
+function ConvertTo-HtmlEncode {
+    param([string]$s)
+    if (-not $s) { return '' }
+    $s = $s.Replace('&',  '&amp;')
+    $s = $s.Replace('<',  '&lt;')
+    $s = $s.Replace('>',  '&gt;')
+    $s = $s.Replace('"',  '&quot;')
+    $s = $s.Replace("'",  '&#39;')
+    return $s
+}
+
+# ── Retry with exponential backoff ─────────────────────────────────────────
+
+function Invoke-WithRetry {
+    param([scriptblock]$Action, [int]$MaxAttempts = 3)
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try { return (& $Action) }
+        catch {
+            $code = 0
+            try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+
+            $retryable = $code -in @(429, 500, 502, 503, 504) -or
+                         ($code -eq 0 -and $_.Exception -is [System.Net.Http.HttpRequestException])
+
+            if ($attempt -ge $MaxAttempts -or -not $retryable) { throw }
+
+            $delay = [Math]::Pow(2, $attempt)   # 2 s, 4 s
+            try {
+                $ra = $_.Exception.Response.Headers['Retry-After']
+                if ($ra -match '^\d+$') { $delay = [Math]::Min([int]$ra, 120) }
+            } catch {}
+
+            Write-Log "HTTP $code — retry $attempt/$MaxAttempts in ${delay}s" "WARN"
+            Start-Sleep -Seconds $delay
+        }
+    }
 }
 
 # ── Database ───────────────────────────────────────────────────────────────
@@ -61,13 +133,15 @@ function Read-Db {
         if (-not (Test-Path $f)) { continue }
         try {
             $obj = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
-            Write-Log "DB loaded from '$(Split-Path $f -Leaf)' (MC: $((&$toHt $obj.messageCenter).Count), Roadmap: $((&$toHt $obj.roadmap).Count))"
+            Write-Log "DB loaded from '$(Split-Path $f -Leaf)'"
             return @{
                 lastRun       = $obj.lastRun
                 messageCenter = & $toHt $obj.messageCenter
                 roadmap       = & $toHt $obj.roadmap
             }
-        } catch { Write-Log "DB '$f' unreadable: $_" "WARN" }
+        } catch {
+            Write-Log "DB '$f' unreadable — $($_.Exception.Message)" "WARN"
+        }
     }
 
     Write-Log "No usable database found — starting fresh" "WARN"
@@ -79,40 +153,69 @@ function Save-Db {
     $tmp = "$($script:DbPath).tmp"
     $bak = "$($script:DbPath).bak"
 
-    # Write to temp first — if this fails, the current DB is untouched
+    # Write to .tmp first — if this step fails, the live DB is untouched
     $Db | ConvertTo-Json -Depth 10 | Set-Content $tmp -Encoding UTF8 -Force
 
-    # Rotate backup
+    # Rotate backup before overwriting live file
     if (Test-Path $script:DbPath) { Copy-Item $script:DbPath $bak -Force }
 
-    # Atomic rename (single filesystem operation on NTFS/ext4)
+    # Atomic rename on same volume (single FS operation)
     Move-Item $tmp $script:DbPath -Force
     Write-Log "DB saved → $(Split-Path $script:DbPath -Leaf)"
 }
 
-# ── Graph ──────────────────────────────────────────────────────────────────
+# ── Graph auth ─────────────────────────────────────────────────────────────
 
 function Get-Token {
-    $r = Invoke-RestMethod -Method POST `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -Body @{
-            grant_type    = "client_credentials"
-            client_id     = $ClientId
-            client_secret = $ClientSecret
-            scope         = "https://graph.microsoft.com/.default"
+    $secret = $ClientSecret          # local copy; cleared below
+    try {
+        $r = Invoke-WithRetry {
+            Invoke-RestMethod -Method POST -TimeoutSec 30 `
+                -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+                -Body @{
+                    grant_type    = "client_credentials"
+                    client_id     = $ClientId
+                    client_secret = $secret
+                    scope         = "https://graph.microsoft.com/.default"
+                }
         }
-    return $r.access_token
+        return $r.access_token
+    } finally {
+        # Best-effort clear — PS strings are immutable so the GC controls lifetime,
+        # but removing the variable avoids accidental leaks in debug output.
+        Remove-Variable -Name secret -ErrorAction SilentlyContinue
+    }
 }
+
+# ── Paged Graph fetch ──────────────────────────────────────────────────────
 
 function Get-GraphPaged {
     param([string]$Uri, [string]$Token)
+    $h     = @{ Authorization = "Bearer $Token" }
     $items = [System.Collections.Generic.List[object]]::new()
     $url   = $Uri
+
     do {
-        $r = Invoke-RestMethod -Uri $url -Headers @{ Authorization = "Bearer $Token" }
+        # Validate nextLink — must stay on graph.microsoft.com to prevent open-redirect
+        $host = ([System.Uri]$url).Host
+        if ($host -ne $GRAPH_HOST) {
+            throw "Unexpected nextLink host '$host' — aborting pagination."
+        }
+
+        $r = Invoke-WithRetry {
+            Invoke-RestMethod -Uri $url -Headers $h -TimeoutSec 60
+        }
+
         if ($r.value) { $items.AddRange([object[]]$r.value) }
+
+        if ($items.Count -ge $MAX_PAGE_ITEMS) {
+            Write-Log "Paging cap ($MAX_PAGE_ITEMS) reached — stopping early" "WARN"
+            break
+        }
+
         $url = $r.'@odata.nextLink'
     } while ($url)
+
     return $items
 }
 
@@ -129,17 +232,25 @@ function Get-MessageCenter {
 # ── Roadmap ────────────────────────────────────────────────────────────────
 
 function Get-Roadmap {
-    # The M365 Roadmap has no official API — data is extracted from the public page's
-    # Next.js SSR payload (__NEXT_DATA__). If parsing breaks, check the page source at:
-    # https://www.microsoft.com/en-us/microsoft-365/roadmap
-    try {
-        $html = (Invoke-WebRequest `
-            -Uri "https://www.microsoft.com/en-us/microsoft-365/roadmap" `
-            -UseBasicParsing -TimeoutSec 30).Content
+    # No official API — data extracted from the Next.js SSR payload (__NEXT_DATA__).
+    # If this breaks, inspect page source at https://www.microsoft.com/en-us/microsoft-365/roadmap
+    $maxResponseBytes = 10 * 1024 * 1024   # 10 MB safety cap
 
-        if ($html -match '<script id="__NEXT_DATA__"[^>]*>([^<]+)</script>') {
-            $nd = $Matches[1] | ConvertFrom-Json
-            # Try known paths in the Next.js data tree
+    try {
+        $resp = Invoke-WithRetry {
+            Invoke-WebRequest -Uri "https://www.microsoft.com/en-us/microsoft-365/roadmap" `
+                -UseBasicParsing -TimeoutSec 30
+        }
+
+        if ($resp.RawContentLength -gt $maxResponseBytes) {
+            Write-Log "Roadmap: response too large ($($resp.RawContentLength) bytes) — skipping" "WARN"
+            return @()
+        }
+
+        $html = $resp.Content
+
+        if ($html -match '<script id="__NEXT_DATA__"[^>]*>([^<]{1,5000000})</script>') {
+            $nd = $Matches[1] | ConvertFrom-Json -ErrorAction Stop
             foreach ($path in @("props.pageProps.items", "props.pageProps.roadmapItems", "props.pageProps.features")) {
                 $node = $nd
                 $ok   = $true
@@ -157,7 +268,7 @@ function Get-Roadmap {
         Write-Log "Roadmap: could not parse page JSON — page structure may have changed" "WARN"
         return @()
     } catch {
-        Write-Log "Roadmap fetch failed: $_" "WARN"
+        Write-Log "Roadmap fetch failed: $($_.Exception.Message)" "WARN"
         return @()
     }
 }
@@ -170,8 +281,8 @@ function Get-McDiff {
     $upd = [System.Collections.Generic.List[object]]::new()
     foreach ($i in $Items) {
         $prev = $Db.messageCenter[$i.id]
-        if     (-not $prev)                                                    { $new.Add($i) }
-        elseif ($prev.lastModifiedDateTime -ne $i.lastModifiedDateTime)        { $upd.Add($i) }
+        if     (-not $prev)                                               { $new.Add($i) }
+        elseif ($prev.lastModifiedDateTime -ne $i.lastModifiedDateTime)   { $upd.Add($i) }
     }
     return @{ New = $new; Updated = $upd }
 }
@@ -204,34 +315,49 @@ function Get-TagString {
 function Build-EmailHtml {
     param($McDiff, $RmDiff)
 
-    $ts     = (Get-Date).ToUniversalTime().ToString("dddd, MMMM d yyyy HH:mm 'UTC'")
+    $ts      = (Get-Date).ToUniversalTime().ToString("dddd, MMMM d yyyy HH:mm 'UTC'")
     $mcTotal = $McDiff.New.Count + $McDiff.Updated.Count
     $rmTotal = $RmDiff.New.Count + $RmDiff.Updated.Count
 
+    # $Text is already HTML-encoded by the caller — kept raw inside the span
     function New-Pill { param([string]$Text, [string]$Bg)
         "<span style='background:$Bg;color:#fff;border-radius:3px;padding:2px 8px;font-size:.75em;font-weight:600;white-space:nowrap'>$Text</span>"
     }
+    # $Title and $Meta must be HTML-encoded before being passed here
     function New-Row { param([string]$Pill, [string]$Title, [string]$Meta)
-        "<tr><td style='padding:9px 4px;border-bottom:1px solid #ececec;vertical-align:top'>$Pill&nbsp; <strong>$Title</strong><br><span style='color:#777;font-size:.83em'>$Meta</span></td></tr>"
+        "<tr><td style='padding:9px 4px;border-bottom:1px solid #ececec;vertical-align:top'>$Pill&nbsp;<strong>$Title</strong><br><span style='color:#777;font-size:.83em'>$Meta</span></td></tr>"
     }
 
     $mcRows = ""
-    foreach ($i in $McDiff.New) {
-        $mod  = if ($i.lastModifiedDateTime) { $i.lastModifiedDateTime.Substring(0,10) } else { "-" }
-        $mcRows += New-Row (New-Pill "NEW" "#107c10") $i.title "$($i.id) &bull; $($i.messageType) &bull; severity: $($i.severity) &bull; $mod"
-    }
-    foreach ($i in $McDiff.Updated) {
-        $mod  = if ($i.lastModifiedDateTime) { $i.lastModifiedDateTime.Substring(0,10) } else { "-" }
-        $mcRows += New-Row (New-Pill "UPDATED" "#ca5010") $i.title "$($i.id) &bull; $($i.messageType) &bull; severity: $($i.severity) &bull; $mod"
+    foreach ($i in $McDiff.New + $McDiff.Updated) {
+        $isNew   = $McDiff.New -contains $i
+        $pill    = New-Pill (if ($isNew) { "NEW" } else { "UPDATED" }) (if ($isNew) { "#107c10" } else { "#ca5010" })
+        $title   = ConvertTo-HtmlEncode $i.title
+        $id      = ConvertTo-HtmlEncode $i.id
+        $type    = ConvertTo-HtmlEncode $i.messageType
+        $sev     = ConvertTo-HtmlEncode $i.severity
+        $rawMod  = if ($i.lastModifiedDateTime -and $i.lastModifiedDateTime.Length -ge 10) { $i.lastModifiedDateTime.Substring(0,10) } else { $i.lastModifiedDateTime }
+        $mod     = ConvertTo-HtmlEncode $rawMod
+        $mcRows += New-Row $pill $title "$id &bull; $type &bull; severity: $sev &bull; $mod"
     }
 
     $rmRows = ""
     foreach ($i in $RmDiff.New) {
-        $rmRows += New-Row (New-Pill "NEW" "#0078d4") $i.title "ID $($i.id) &bull; $($i.status) &bull; $(Get-TagString $i.tags)"
+        $pill    = New-Pill "NEW" "#0078d4"
+        $title   = ConvertTo-HtmlEncode $i.title
+        $id      = ConvertTo-HtmlEncode ([string]$i.id)
+        $status  = ConvertTo-HtmlEncode $i.status
+        $tags    = ConvertTo-HtmlEncode (Get-TagString $i.tags)
+        $rmRows += New-Row $pill $title "ID $id &bull; $status &bull; $tags"
     }
     foreach ($i in $RmDiff.Updated) {
-        $pill   = New-Pill "$($i.prevStatus) → $($i.status)" "#8764b8"
-        $rmRows += New-Row $pill $i.title "ID $($i.id) &bull; $(Get-TagString $i.tags)"
+        $prev    = ConvertTo-HtmlEncode $i.prevStatus
+        $cur     = ConvertTo-HtmlEncode $i.status
+        $pill    = New-Pill "$prev → $cur" "#8764b8"
+        $title   = ConvertTo-HtmlEncode $i.title
+        $id      = ConvertTo-HtmlEncode ([string]$i.id)
+        $tags    = ConvertTo-HtmlEncode (Get-TagString $i.tags)
+        $rmRows += New-Row $pill $title "ID $id &bull; $tags"
     }
 
     $mcSection = if ($mcRows) {
@@ -274,10 +400,12 @@ function Send-Email {
         saveToSentItems = $false
     } | ConvertTo-Json -Depth 10 -Compress
 
-    Invoke-RestMethod -Method POST `
-        -Uri "$GRAPH/users/$SenderMailbox/sendMail" `
-        -Headers @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" } `
-        -Body $body | Out-Null
+    Invoke-WithRetry {
+        Invoke-RestMethod -Method POST -TimeoutSec 60 `
+            -Uri "$GRAPH/users/$SenderMailbox/sendMail" `
+            -Headers @{ Authorization = "Bearer $Token"; "Content-Type" = "application/json" } `
+            -Body $body | Out-Null
+    }
 
     Write-Log "Email sent → $($Recipients -join ', ')" "SUCCESS"
 }
@@ -331,9 +459,7 @@ $rmDiff = Get-RmDiff -Items $rmItems -Db $db
 $total  = $mcDiff.New.Count + $mcDiff.Updated.Count + $rmDiff.New.Count + $rmDiff.Updated.Count
 Write-Log "Changes — MC: $($mcDiff.New.Count) new / $($mcDiff.Updated.Count) updated | Roadmap: $($rmDiff.New.Count) new / $($rmDiff.Updated.Count) status changes"
 
-# Email — DB is intentionally written AFTER this block.
-# If Send-Email throws, $ErrorActionPreference=Stop exits here and the DB stays
-# unchanged, so the next run will retry sending the same items.
+# DB is written AFTER a successful send so a transient failure retries on the next run.
 if (-not $NoEmail -and ($total -gt 0 -or $ForceFullReport)) {
     $html = Build-EmailHtml -McDiff $mcDiff -RmDiff $rmDiff
     Send-Email -Token $token -Html $html -McDiff $mcDiff -RmDiff $rmDiff
@@ -345,5 +471,8 @@ if (-not $NoEmail -and ($total -gt 0 -or $ForceFullReport)) {
 
 Update-Db  -Db $db -McItems $mcItems -RmItems $rmItems
 Save-Db    -Db $db
+
+# Clear token from session memory
+Remove-Variable -Name token -ErrorAction SilentlyContinue
 
 Write-Log "Done" "SUCCESS"
